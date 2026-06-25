@@ -8,8 +8,12 @@ SeedHub CLI - 影视资源搜索 & 下载链接提取
 import sys
 import os
 import re
+import time
+import base64
+import threading
 import argparse
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
     import cloudscraper
@@ -19,6 +23,21 @@ except ImportError:
     sys.exit(1)
 
 SEEDHUB_BASE = "https://www.seedhub.cc"
+
+
+_rate_lock = threading.Lock()
+_last_req_time = 0.0
+_MIN_INTERVAL = 0.5
+
+
+def _rate_wait():
+    """全局速率控制：确保两次请求间隔不小于 _MIN_INTERVAL"""
+    global _last_req_time
+    with _rate_lock:
+        elapsed = time.time() - _last_req_time
+        if elapsed < _MIN_INTERVAL:
+            time.sleep(_MIN_INTERVAL - elapsed)
+        _last_req_time = time.time()
 
 
 def create_scraper():
@@ -65,6 +84,133 @@ def search(keyword: str, limit: int = 20) -> list[dict]:
         })
 
     return results
+
+
+def get_top_movies(limit: int = 20, scraper=None) -> list[dict]:
+    """获取首页最新影视列表"""
+    if scraper is None:
+        scraper = create_scraper()
+
+    try:
+        r = scraper.get(SEEDHUB_BASE, timeout=30)
+        if r.status_code != 200:
+            print(f"❌ HTTP 错误: {r.status_code}", file=sys.stderr)
+            return []
+    except Exception as e:
+        print(f"❌ 请求失败: {e}", file=sys.stderr)
+        return []
+
+    html = r.text
+
+    # 复用 search 的正则解析首页电影卡片
+    movies = re.findall(
+        r'title="([^"]+)"[^>]*class="image"[^>]*href="(/movies/\d+)/?"', html
+    )
+    infos = re.findall(
+        r"<li>(\d{4}\s*/\s*(?:电影|剧集|动漫)[^<]*)</li>", html
+    )
+    ratings = re.findall(
+        r'豆瓣评分:\s*<a[^>]*>([^<]+)</a>', html
+    )
+
+    results = []
+    for i, (title, path) in enumerate(movies[:limit]):
+        m = re.search(r"/movies/(\d+)/?", path)
+        movie_id = m.group(1) if m else "unknown"
+        # 反转义 HTML 实体
+        title = title.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+        results.append({
+            "title": title,
+            "info": infos[i].strip() if i < len(infos) else "",
+            "rating": ratings[i] if i < len(ratings) else "?",
+            "id": movie_id,
+            "url": f"{SEEDHUB_BASE}/movies/{movie_id}/",
+        })
+
+    return results
+
+
+def _resolve_magnet(scraper, link_url: str) -> str:
+    """从种子链接页面解析真实磁力链接（base64 编码在 JS 中）"""
+    for attempt in range(2):
+        try:
+            _rate_wait()
+            r = scraper.get(link_url, timeout=10)
+            if r.status_code != 200:
+                continue
+            # 匹配 const data = "base64字符串"
+            b64_match = re.search(r'const\s+data\s*=\s*"([A-Za-z0-9+/=]+)"', r.text)
+            if b64_match:
+                decoded = base64.b64decode(b64_match.group(1)).decode("utf-8", errors="ignore")
+                if decoded.startswith("magnet:"):
+                    return decoded
+        except Exception:
+            if attempt == 0:
+                time.sleep(0.5)
+    return ""
+
+
+def get_movie_detail(movie_id: str, seed_limit: int = 3, scraper=None) -> dict:
+    """获取电影详情：简介 + 最新资源"""
+    url = f"{SEEDHUB_BASE}/movies/{movie_id}/"
+    if scraper is None:
+        scraper = create_scraper()
+
+    r = None
+    for attempt in range(3):
+        try:
+            _rate_wait()
+            r = scraper.get(url, timeout=30)
+            if r.status_code == 200 and len(r.text) > 1000:
+                break
+            # 状态码异常或内容太短，刷新 scraper 重试
+            time.sleep(1)
+            scraper = create_scraper()
+        except Exception:
+            time.sleep(1)
+            scraper = create_scraper()
+    if r is None or r.status_code != 200:
+        return {"summary": "", "seeds": [], "tabs": {}}
+
+    html = r.text
+
+    # 提取简介：id="description" 所在 <h2> 之后的 <p> 标签
+    summary = ""
+    desc_match = re.search(
+        r'id="description"[^>]*>.*?</h2>\s*<p[^>]*>(.*?)</p>',
+        html, re.DOTALL,
+    )
+    if desc_match:
+        summary = re.sub(r"<[^>]+>", "", desc_match.group(1)).strip()
+
+    # 提取各类型链接数量
+    tabs = {}
+    for name, count in re.findall(r'(磁力|百度|夸克|迅雷|UC|阿里)\((\d+)\)', html):
+        tabs[name] = int(count)
+
+    # 提取种子资源列表（磁力链详情）
+    seeds = []
+    seed_section = html.find('class="seeds"')
+    if seed_section >= 0:
+        section = html[seed_section:seed_section + 20000]
+        items = re.findall(
+            r'<li>\s*<a[^>]*title="([^"]+)"[^>]*href="([^"]+)"[^>]*>.*?</a>.*?'
+            r'<code[^>]*>([^<]+)</code>',
+            section, re.DOTALL,
+        )
+        for title, href, size in items[:seed_limit]:
+            title = title.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+            link = f"{SEEDHUB_BASE}{href}" if href.startswith("/") else href
+            # 解析真实磁力链接
+            magnet = _resolve_magnet(scraper, link)
+            seeds.append({
+                "title": title,
+                "link": link,
+                "size": size.strip(),
+                "magnet": magnet,
+            })
+
+    return {"summary": summary, "seeds": seeds, "tabs": tabs}
 
 
 def get_links(movie_id: str, quark_limit: int = 10) -> dict:
@@ -244,6 +390,63 @@ def cmd_links(args):
         print(f"\n💡 夸克链接已自动解析为可直接访问的 URL")
 
 
+def cmd_top(args):
+    """首页最新影视"""
+    print("🏠 SeedHub 首页最新影视\n")
+
+    movies = get_top_movies(limit=args.limit)
+
+    if not movies:
+        print("❌ 获取失败，请稍后重试")
+        return
+
+    threads = args.threads
+
+    # 并发获取详情（全局速率控制在 _rate_wait 中）
+    details = {}
+    with ThreadPoolExecutor(max_workers=threads) as executor:
+        future_map = {
+            executor.submit(get_movie_detail, movie["id"], 3): idx
+            for idx, movie in enumerate(movies)
+        }
+        for future in as_completed(future_map):
+            idx = future_map[future]
+            try:
+                details[idx] = future.result()
+            except Exception:
+                details[idx] = {"summary": "", "seeds": [], "tabs": {}}
+
+    # 按顺序输出
+    for i, movie in enumerate(movies):
+        detail = details.get(i, {"summary": "", "seeds": [], "tabs": {}})
+        print(f"{i + 1}. {movie['title']}")
+        print(f"   📅 {movie['info'] or 'N/A'} | ⭐ 豆瓣 {movie['rating']}")
+
+        if detail["summary"]:
+            summary = detail["summary"]
+            if len(summary) > 80:
+                summary = summary[:80] + "..."
+            print(f"   📝 {summary}")
+
+        if detail["tabs"]:
+            parts = [f"{name}({cnt})" for name, cnt in detail["tabs"].items() if cnt > 0]
+            if parts:
+                print(f"   🔗 {' / '.join(parts)}")
+
+        if detail["seeds"]:
+            print(f"   🧲 最新资源:")
+            for seed in detail["seeds"]:
+                title = seed["title"]
+                if len(title) > 60:
+                    title = title[:60] + "..."
+                print(f"      • {title} / {seed['size']}")
+                if seed.get("magnet"):
+                    print(f"        {seed['magnet']}")
+
+        print(f"   📌 ID: {movie['id']}")
+        print()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="SeedHub CLI - 影视资源搜索 & 下载链接提取",
@@ -254,6 +457,9 @@ def main():
   %(prog)s search "至尊马蒂" --limit 5
   %(prog)s links 119254
   %(prog)s links 129054 --limit 20
+  %(prog)s top
+  %(prog)s top --limit 10
+  %(prog)s top --limit 10 --threads 3
         """,
     )
 
@@ -270,6 +476,12 @@ def main():
     sp_links.add_argument("movie_id", help="电影 ID (从搜索结果获取)")
     sp_links.add_argument("--limit", "-n", type=int, default=10, help="解析的夸克链接数 (默认: 10)")
     sp_links.set_defaults(func=cmd_links)
+
+    # top
+    sp_top = subparsers.add_parser("top", aliases=["t"], help="查看首页最新影视")
+    sp_top.add_argument("--limit", "-n", type=int, default=20, help="最大数量 (默认: 20)")
+    sp_top.add_argument("--threads", "-j", type=int, default=5, help="并发线程数 (默认: 5)")
+    sp_top.set_defaults(func=cmd_top)
 
     args = parser.parse_args()
 
